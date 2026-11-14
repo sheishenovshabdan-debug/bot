@@ -1,0 +1,2397 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Телеграм-бот записи в мастерскую по ремонту телефонов (aiogram 3).
+
+Что умеет:
+  • запись: услуга → модель → день → время → имя → телефон → (фото неисправности);
+  • «Мои записи»: посмотреть, отменить, перенести;
+  • цены, контакты, частые вопросы, проверка гарантии по телефону;
+  • заявка приходит владельцу с кнопками «Подтвердить / Отклонить / Телефон готов»;
+  • «телефон готов» — клиент сразу получает адрес и график;
+  • закрытие дней и часов: /close, /open, /closures;
+  • напоминания накануне вечером, за пару часов до визита и запрос отзыва после ремонта;
+  • админка: /admin, /today, /tomorrow, /week, /stats, /find, /export, /sync,
+    /broadcast, /ready, /reviews;
+  • выгрузка в Google Таблицу (необязательно).
+
+Запуск:
+    pip install -r requirements.txt
+    python bot_v2.py
+
+Все настройки берутся из переменных окружения (можно положить их в файл .env).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import calendar
+import csv
+import html
+import io
+import logging
+import os
+import re
+import sqlite3
+import sys
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ParseMode
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+try:  # python-dotenv — необязательная зависимость
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:  # pragma: no cover
+    pass
+
+
+# ============================== НАСТРОЙКИ ==============================
+
+def _env(name: str, default: str = "") -> str:
+    value = os.getenv(name)
+    return default if value is None or not value.strip() else value.strip()
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(_env(name, str(default)))
+    except ValueError:
+        logging.warning("Переменная %s должна быть числом, беру %s", name, default)
+        return default
+
+
+BOT_TOKEN = _env("BOT_TOKEN")
+ADMIN_ID = _env_int("ADMIN_ID", 0)
+
+DB_PATH = _env("DB_PATH", "bookings.db")
+LOG_PATH = _env("LOG_PATH", "bot.log")
+TZ = ZoneInfo(_env("BOT_TZ", "Asia/Yekaterinburg"))
+
+SHOP_NAME = _env("SHOP_NAME", "СитиАкс")
+ADDRESS = _env("ADDRESS", "ул. Академика Сахарова, 107/1")
+PHONE = _env("PHONE", "+7 932 127-44-92")
+WORK_TEXT = _env("WORK_TEXT", "Ежедневно 11:00-22:00, без выходных")
+TELEGRAM_URL = _env("TELEGRAM_URL", "https://t.me/SHVHSA")
+MAPS_URL = _env("MAPS_URL", "")  # необязательно: ссылка на карту
+
+# (название, цена, срок). Цены примерные — поставьте свои.
+SERVICES: list[tuple[str, str, str]] = [
+    ("Замена экрана", "от 3000 ₽", "около 1 часа"),
+    ("Замена батареи", "от 1500 ₽", "30-40 минут"),
+    ("Разъём зарядки", "от 1200 ₽", "около 1 часа"),
+    ("Чистка после воды", "от 1500 ₽", "1-2 дня"),
+    ("Диагностика", "бесплатно", "15-20 минут"),
+]
+
+WORK_HOURS = range(_env_int("WORK_START", 11), _env_int("WORK_END", 22))  # 11..21
+DAYS_AHEAD = _env_int("DAYS_AHEAD", 7)
+DAYS_OFF = {int(x) for x in _env("DAYS_OFF", "").split(",") if x.strip().isdigit()}
+LEAD_MINUTES = _env_int("LEAD_MINUTES", 60)      # нельзя записаться «за 10 минут»
+MAX_ACTIVE = _env_int("MAX_ACTIVE", 3)           # активных записей на одного человека
+REMINDER_TICK = _env_int("REMINDER_TICK", 300)   # как часто проверять напоминания, сек
+REMIND_EVENING_HOUR = _env_int("REMIND_EVENING_HOUR", 18)
+REMIND_SOON_HOURS = _env_int("REMIND_SOON_HOURS", 2)
+
+# гарантия и отзывы
+WARRANTY_MONTHS = _env_int("WARRANTY_MONTHS", 3)
+REVIEW_DELAY_DAYS = _env_int("REVIEW_DELAY_DAYS", 2)
+REVIEW_URL = _env("REVIEW_URL", "")  # ссылка на отзывы (карты/Яндекс)
+
+# Google Таблица (необязательно): сервис-аккаунт и ID таблицы
+GOOGLE_SHEET_ID = _env("GOOGLE_SHEET_ID", "")
+GOOGLE_CREDENTIALS_FILE = _env("GOOGLE_CREDENTIALS_FILE", "")
+
+# статусы: pending -> confirmed -> ready (телефон готов) -> done | cancelled
+ACTIVE_STATUSES = ("pending", "confirmed")                 # что клиент может отменить/перенести
+OCCUPYING_STATUSES = ("pending", "confirmed", "ready")     # что занимает слот
+WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+
+BTN_BOOK = "📝 Записаться"
+BTN_MY = "📋 Мои записи"
+BTN_PRICES = "💰 Цены"
+BTN_CONTACTS = "📍 Контакты"
+BTN_HELP = "❓ Помощь"
+BTN_FAQ = "❓ Вопросы"
+BTN_WARRANTY = "🛡 Гарантия"
+BTN_ADMIN = "🛠 Админка"
+
+# (вопрос, ответ) — редактируйте под себя
+FAQ: list[tuple[str, str]] = [
+    ("Сколько делается экран?",
+     "Замена экрана на большинстве моделей — около 1 часа. Если нужной детали нет "
+     "в наличии, привозим под заказ за 1-2 дня."),
+    ("Есть ли гарантия?",
+     f"Да, {WARRANTY_MONTHS} месяца на работу и установленную запчасть. "
+     "Проверить срок можно кнопкой «🛡 Гарантия»."),
+    ("Оригинальные ли запчасти?",
+     "Ставим оригинальные детали или качественные аналоги — всегда говорим заранее, "
+     "что именно будет установлено и сколько это стоит."),
+    ("Сколько стоит диагностика?",
+     "Бесплатно, 15-20 минут. Если ремонт не нужен — ничего не платите."),
+    ("Можно ли отремонтировать сегодня?",
+     "Многие ремонты делаем в день обращения: экраны и батареи — обычно за час. "
+     "Точное время скажем при подтверждении записи."),
+]
+
+logging.getLogger("aiogram.event").setLevel(logging.WARNING)
+router = Router()
+
+
+# ============================== ВРЕМЯ И ТЕКСТ ==============================
+
+def now() -> datetime:
+    """Текущее время в часовом поясе салона (а не в поясе сервера)."""
+    return datetime.now(TZ)
+
+
+def today_str() -> str:
+    return now().date().isoformat()
+
+
+def iso_now() -> str:
+    return now().isoformat(timespec="seconds")
+
+
+def slot_times() -> list[str]:
+    return [f"{h:02d}:00" for h in WORK_HOURS]
+
+
+def slot_dt(day: str, t: str) -> datetime:
+    d = date.fromisoformat(day)
+    hh, mm = (int(x) for x in t.split(":"))
+    return datetime(d.year, d.month, d.day, hh, mm, tzinfo=TZ)
+
+
+def fmt_day(day: str) -> str:
+    d = date.fromisoformat(day)
+    return f"{d:%d.%m} ({WEEKDAYS[d.weekday()]})"
+
+
+def day_human(day: str) -> str:
+    delta = (date.fromisoformat(day) - now().date()).days
+    if delta == 0:
+        return "сегодня"
+    if delta == 1:
+        return "завтра"
+    return fmt_day(day)
+
+
+def esc(value: object) -> str:
+    return html.escape(str(value or ""), quote=False)
+
+
+def fmt_phone(phone: str) -> str:
+    digits = re.sub(r"\D", "", phone or "")
+    if len(digits) == 11 and digits[0] in "78":
+        return f"+7 ({digits[1:4]}) {digits[4:7]}-{digits[7:9]}-{digits[9:11]}"
+    return phone or ""
+
+
+def normalize_phone(raw: str) -> str | None:
+    digits = re.sub(r"\D", "", raw or "")
+    if not digits:
+        return None
+    if len(digits) == 11 and digits[0] == "8":
+        digits = "7" + digits[1:]
+    elif len(digits) == 10:
+        digits = "7" + digits
+    if not 10 <= len(digits) <= 15:
+        return None
+    return "+" + digits
+
+
+def clean_name(raw: str) -> str | None:
+    value = " ".join((raw or "").split())
+    if not 2 <= len(value) <= 50:
+        return None
+    if len(re.findall(r"[A-Za-zА-Яа-яЁё]", value)) < 2:
+        return None
+    return value
+
+
+def clean_model(raw: str) -> str | None:
+    value = " ".join((raw or "").split())
+    if not 2 <= len(value) <= 60:
+        return None
+    if not re.search(r"[A-Za-zА-Яа-яЁё0-9]", value):
+        return None
+    return value
+
+
+def is_admin(user) -> bool:
+    return bool(ADMIN_ID) and getattr(user, "id", None) == ADMIN_ID
+
+
+def is_bookable_day(day: str) -> bool:
+    try:
+        d = date.fromisoformat(day)
+    except ValueError:
+        return False
+    today = now().date()
+    if not today <= d <= today + timedelta(days=DAYS_AHEAD - 1):
+        return False
+    return d.weekday() not in DAYS_OFF
+
+
+# ============================== БАЗА ==============================
+
+TABLE_BOOKINGS = """
+CREATE TABLE IF NOT EXISTS {name} (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         INTEGER NOT NULL,
+    username        TEXT,
+    name            TEXT    NOT NULL DEFAULT '',
+    phone           TEXT    NOT NULL DEFAULT '',
+    service         TEXT    NOT NULL DEFAULT '',
+    price           TEXT,
+    model           TEXT    NOT NULL DEFAULT '',
+    day             TEXT    NOT NULL,
+    time            TEXT    NOT NULL,
+    status          TEXT    NOT NULL DEFAULT 'pending',
+    reminded_day    INTEGER NOT NULL DEFAULT 0,
+    reminded_soon   INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT    NOT NULL DEFAULT ''
+)
+"""
+
+TABLE_USERS = """
+CREATE TABLE IF NOT EXISTS users (
+    user_id     INTEGER PRIMARY KEY,
+    username    TEXT,
+    first_name  TEXT,
+    created_at  TEXT NOT NULL DEFAULT '',
+    seen_at     TEXT NOT NULL DEFAULT '',
+    opt_in      INTEGER NOT NULL DEFAULT 1
+)
+"""
+
+TABLE_CLOSURES = """
+CREATE TABLE IF NOT EXISTS closures (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    day         TEXT NOT NULL,
+    time        TEXT,
+    reason      TEXT,
+    created_at  TEXT NOT NULL DEFAULT ''
+)
+"""
+
+TABLE_REVIEWS = """
+CREATE TABLE IF NOT EXISTS reviews (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    booking_id  INTEGER NOT NULL,
+    user_id     INTEGER NOT NULL,
+    rating      INTEGER NOT NULL,
+    comment     TEXT,
+    created_at  TEXT NOT NULL DEFAULT ''
+)
+"""
+
+INDEXES = """
+DROP INDEX IF EXISTS ux_bookings_active_slot;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_bookings_active_slot
+    ON bookings(day, time) WHERE status IN ('pending', 'confirmed', 'ready');
+CREATE INDEX IF NOT EXISTS ix_bookings_day ON bookings(day, status);
+CREATE INDEX IF NOT EXISTS ix_bookings_user ON bookings(user_id, status);
+CREATE INDEX IF NOT EXISTS ix_bookings_phone ON bookings(phone);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_closures_slot
+    ON closures(day, IFNULL(time, ''));
+CREATE INDEX IF NOT EXISTS ix_reviews_booking ON reviews(booking_id);
+"""
+
+
+def _connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")   # меньше блокировок при параллельных запросах
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
+@contextmanager
+def db():
+    """Соединение, которое всегда закрывается (в старом коде утекали дескрипторы)."""
+    conn = _connect()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _rebuild_legacy_table(conn: sqlite3.Connection) -> None:
+    """Старая схема содержала UNIQUE(day, time) — из-за него нельзя было
+    отменить запись и занять слот снова. Пересобираем таблицу без него."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='bookings'"
+    ).fetchone()
+    if not row or not row["sql"] or "UNIQUE" not in row["sql"].upper():
+        return
+
+    old_cols = {r["name"] for r in conn.execute("PRAGMA table_info(bookings)")}
+    conn.execute("ALTER TABLE bookings RENAME TO bookings_legacy")
+    conn.execute(TABLE_BOOKINGS.format(name="bookings"))
+
+    new_cols = [r["name"] for r in conn.execute("PRAGMA table_info(bookings)")]
+    source: dict[str, str] = {}
+    for col in new_cols:
+        if col in old_cols:
+            source[col] = col
+        elif col == "reminded_day" and "reminded" in old_cols:
+            source[col] = "reminded"
+
+    targets = list(source)
+    conn.execute(
+        f"INSERT INTO bookings ({', '.join(targets)}) "
+        f"SELECT {', '.join(source[c] for c in targets)} FROM bookings_legacy"
+    )
+    conn.execute("DROP TABLE bookings_legacy")
+    logging.info("Миграция bookings выполнена: старый UNIQUE(day, time) снят")
+
+
+def _add_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    for column, ddl in columns.items():
+        if column not in have:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
+def init_db() -> None:
+    with db() as conn:
+        _rebuild_legacy_table(conn)
+        conn.execute(TABLE_BOOKINGS.format(name="bookings"))
+        conn.execute(TABLE_USERS)
+        conn.execute(TABLE_CLOSURES)
+        conn.execute(TABLE_REVIEWS)
+        _add_columns(conn, "bookings", {
+            "username": "TEXT",
+            "price": "TEXT",
+            "status": "TEXT NOT NULL DEFAULT 'pending'",
+            "reminded_day": "INTEGER NOT NULL DEFAULT 0",
+            "reminded_soon": "INTEGER NOT NULL DEFAULT 0",
+            "created_at": "TEXT NOT NULL DEFAULT ''",
+            "photo_id": "TEXT",
+            "ready_at": "TEXT",
+            "review_requested": "INTEGER NOT NULL DEFAULT 0",
+        })
+        _add_columns(conn, "users", {
+            "opt_in": "INTEGER NOT NULL DEFAULT 1",
+        })
+        conn.executescript(INDEXES)
+
+
+def busy_slots(day: str) -> set[str]:
+    placeholders = ",".join("?" for _ in OCCUPYING_STATUSES)
+    with db() as conn:
+        rows = conn.execute(
+            f"SELECT time FROM bookings WHERE day=? AND status IN ({placeholders})",
+            (day, *OCCUPYING_STATUSES),
+        )
+        return {r["time"] for r in rows}
+
+
+def closed_slots(day: str) -> set[str]:
+    """Слоты, закрытые владельцем: выходной, обед, отпуск."""
+    with db() as conn:
+        rows = conn.execute("SELECT time FROM closures WHERE day=?", (day,)).fetchall()
+    if any(r["time"] is None for r in rows):
+        return set(slot_times())
+    return {r["time"] for r in rows if r["time"]}
+
+
+def free_slots(day: str, exclude: sqlite3.Row | None = None) -> list[str]:
+    """Свободные слоты дня с учётом занятости, закрытий и запаса времени."""
+    if not is_bookable_day(day):
+        return []
+    busy = busy_slots(day)
+    if exclude is not None and exclude["day"] == day:
+        busy.discard(exclude["time"])
+    blocked = busy | closed_slots(day)
+    deadline = now() + timedelta(minutes=LEAD_MINUTES)
+    return [t for t in slot_times() if t not in blocked and slot_dt(day, t) > deadline]
+
+
+def upsert_user(user) -> None:
+    if user is None:
+        return
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO users (user_id, username, first_name, created_at, seen_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                   username=excluded.username,
+                   first_name=excluded.first_name,
+                   seen_at=excluded.seen_at""",
+            (user.id, user.username, user.first_name, iso_now(), iso_now()),
+        )
+
+
+def active_count(user_id: int) -> int:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM bookings "
+            "WHERE user_id=? AND day>=? AND status IN ('pending','confirmed')",
+            (user_id, today_str()),
+        ).fetchone()
+        return int(row[0])
+
+
+def active_bookings(user_id: int) -> list[sqlite3.Row]:
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM bookings "
+            "WHERE user_id=? AND day>=? AND status IN ('pending','confirmed') "
+            "ORDER BY day, time",
+            (user_id, today_str()),
+        ).fetchall()
+
+
+def ready_bookings(user_id: int) -> list[sqlite3.Row]:
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM bookings WHERE user_id=? AND status='ready' "
+            "ORDER BY ready_at DESC LIMIT 5",
+            (user_id,),
+        ).fetchall()
+
+
+def next_booking(user_id: int) -> sqlite3.Row | None:
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM bookings "
+            "WHERE user_id=? AND day>=? AND status IN ('pending','confirmed') "
+            "ORDER BY day, time LIMIT 1",
+            (user_id, today_str()),
+        ).fetchone()
+
+
+def get_booking(booking_id: int) -> sqlite3.Row | None:
+    with db() as conn:
+        return conn.execute("SELECT * FROM bookings WHERE id=?", (booking_id,)).fetchone()
+
+
+def bookings_for_day(day: str) -> list[sqlite3.Row]:
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM bookings WHERE day=? AND status!='cancelled' ORDER BY time",
+            (day,),
+        ).fetchall()
+
+
+def upcoming_booking_ids() -> list[int]:
+    with db() as conn:
+        return [r["id"] for r in conn.execute(
+            "SELECT id FROM bookings WHERE day>=? ORDER BY day, time", (today_str(),))]
+
+
+def all_user_ids() -> list[int]:
+    with db() as conn:
+        return [r["user_id"] for r in conn.execute("SELECT user_id FROM users WHERE opt_in=1")]
+
+
+def set_opt_in(user_id: int, value: bool) -> None:
+    with db() as conn:
+        conn.execute("UPDATE users SET opt_in=? WHERE user_id=?",
+                     (1 if value else 0, user_id))
+
+
+def user_ids_for(audience: str) -> list[int]:
+    with db() as conn:
+        if audience == "bookers":
+            rows = conn.execute(
+                "SELECT DISTINCT b.user_id FROM bookings b "
+                "JOIN users u ON u.user_id=b.user_id WHERE u.opt_in=1"
+            )
+        else:
+            rows = conn.execute("SELECT user_id FROM users WHERE opt_in=1")
+        return [r["user_id"] for r in rows]
+
+
+# ---------- закрытие дней и часов ----------
+
+def add_closure(day: str, slot: str | None = None, reason: str = "") -> None:
+    with db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO closures (day, time, reason, created_at) VALUES (?,?,?,?)",
+            (day, slot, reason, iso_now()))
+
+
+def remove_closure(day: str, slot: str | None = None) -> int:
+    with db() as conn:
+        if slot is None:
+            cursor = conn.execute("DELETE FROM closures WHERE day=?", (day,))
+        else:
+            cursor = conn.execute("DELETE FROM closures WHERE day=? AND time=?", (day, slot))
+        return cursor.rowcount
+
+
+def upcoming_closures(days: int = 14) -> list[sqlite3.Row]:
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM closures WHERE day BETWEEN ? AND ? ORDER BY day, time",
+            (today_str(), (now().date() + timedelta(days=days)).isoformat()),
+        ).fetchall()
+
+
+# ---------- гарантия ----------
+
+def add_months(value: date, months: int) -> date:
+    month_index = value.month - 1 + months
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    return date(year, month, min(value.day, calendar.monthrange(year, month)[1]))
+
+
+def warranty_rows(phone: str) -> list[sqlite3.Row]:
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM bookings WHERE phone=? AND ready_at IS NOT NULL "
+            "AND status IN ('ready','done') ORDER BY ready_at DESC",
+            (phone,),
+        ).fetchall()
+
+
+# ---------- отзывы ----------
+
+def save_review(booking_id: int, user_id: int, rating: int) -> None:
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO reviews (booking_id, user_id, rating, created_at) VALUES (?,?,?,?)",
+            (booking_id, user_id, rating, iso_now()))
+        conn.execute("UPDATE bookings SET review_requested=1 WHERE id=?", (booking_id,))
+
+
+def review_stats() -> tuple[float, int]:
+    with db() as conn:
+        row = conn.execute("SELECT AVG(rating), COUNT(*) FROM reviews").fetchone()
+    average = round(float(row[0]), 1) if row[0] is not None else 0.0
+    return average, int(row[1])
+
+
+def recent_reviews(limit: int = 5) -> list[sqlite3.Row]:
+    with db() as conn:
+        return conn.execute(
+            "SELECT r.*, b.name, b.service FROM reviews r "
+            "JOIN bookings b ON b.id=r.booking_id ORDER BY r.id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+
+# ---------- Google Таблица ----------
+
+SHEET_TITLE = "Записи"
+SHEET_HEADER = ["id", "дата", "время", "статус", "услуга", "модель", "имя",
+                "телефон", "username", "создано", "готово"]
+_sheet_warned = False
+_background_tasks: set[asyncio.Task] = set()
+
+
+def sheets_enabled() -> bool:
+    return bool(GOOGLE_SHEET_ID and GOOGLE_CREDENTIALS_FILE)
+
+
+def sheets_ready() -> bool:
+    if not sheets_enabled():
+        return False
+    try:
+        import gspread  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _worksheet():
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    credentials = Credentials.from_service_account_file(
+        GOOGLE_CREDENTIALS_FILE,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
+    client = gspread.authorize(credentials)
+    spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+    try:
+        return spreadsheet.worksheet(SHEET_TITLE)
+    except gspread.WorksheetNotFound:
+        return spreadsheet.add_worksheet(title=SHEET_TITLE, rows=1000, cols=12)
+
+
+def sync_booking_to_sheet(booking_id: int) -> None:
+    """Добавляет/обновляет строку в Google Таблице. Без ключей — молча ничего не делает."""
+    global _sheet_warned
+    if not sheets_enabled():
+        return
+    try:
+        import gspread
+    except ImportError:
+        if not _sheet_warned:
+            logging.warning("Google Sheets: установите gspread и google-auth "
+                            "(pip install gspread google-auth)")
+            _sheet_warned = True
+        return
+    row = get_booking(booking_id)
+    if row is None:
+        return
+    values = [
+        str(row["id"]), row["day"], row["time"], row["status"], row["service"],
+        row["model"] or "", row["name"], row["phone"], row["username"] or "",
+        row["created_at"] or "", row["ready_at"] or "",
+    ]
+    try:
+        worksheet = _worksheet()
+        if not worksheet.get_all_values():
+            worksheet.append_row(SHEET_HEADER)
+        try:
+            cell = worksheet.find(str(row["id"]), in_column=1)
+        except gspread.exceptions.CellNotFound:
+            cell = None
+        if cell is not None:
+            worksheet.update(values=[values], range_name=f"A{cell.row}:K{cell.row}")
+        else:
+            worksheet.append_row(values)
+    except Exception:
+        logging.exception("Google Sheets: не удалось синхронизировать запись #%s", booking_id)
+
+
+def spawn_sheet_sync(booking_id: int) -> None:
+    if not sheets_enabled():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(asyncio.to_thread(sync_booking_to_sheet, booking_id))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+# ============================== КЛАВИАТУРЫ ==============================
+
+def menu_kb(user_id: int | None = None) -> ReplyKeyboardMarkup:
+    keyboard = [
+        [KeyboardButton(text=BTN_BOOK)],
+        [KeyboardButton(text=BTN_MY), KeyboardButton(text=BTN_PRICES)],
+        [KeyboardButton(text=BTN_WARRANTY), KeyboardButton(text=BTN_FAQ)],
+        [KeyboardButton(text=BTN_CONTACTS)],
+    ]
+    if ADMIN_ID and user_id == ADMIN_ID:
+        keyboard.append([KeyboardButton(text=BTN_ADMIN)])
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+
+def phone_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Отправить мой номер", request_contact=True)]],
+        resize_keyboard=True, one_time_keyboard=True,
+    )
+
+
+def services_kb():
+    builder = InlineKeyboardBuilder()
+    for i, (name, price, _term) in enumerate(SERVICES):
+        builder.button(text=f"{name} · {price}", callback_data=f"svc:{i}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def days_kb(prefix: str = "day", back_cb: str | None = "back:svc",
+            exclude: sqlite3.Row | None = None):
+    """Дни, в которых остались свободные слоты. None — если свободных дней нет."""
+    builder = InlineKeyboardBuilder()
+    today = now().date()
+    added = 0
+    for i in range(DAYS_AHEAD):
+        d = today + timedelta(days=i)
+        if d.weekday() in DAYS_OFF:
+            continue
+        day_iso = d.isoformat()
+        if not free_slots(day_iso, exclude=exclude):
+            continue
+        if i == 0:
+            label = "Сегодня"
+        elif i == 1:
+            label = "Завтра"
+        else:
+            label = f"{d:%d.%m} {WEEKDAYS[d.weekday()]}"
+        builder.button(text=label, callback_data=f"{prefix}:{day_iso}")
+        added += 1
+    if not added:
+        return None
+    builder.adjust(3)
+    if back_cb:
+        builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb))
+    return builder.as_markup()
+
+
+def times_kb(day: str, prefix: str = "time", back_cb: str = "back:day",
+             exclude: sqlite3.Row | None = None):
+    builder = InlineKeyboardBuilder()
+    slots = free_slots(day, exclude=exclude)
+    for t in slots:
+        builder.button(text=t, callback_data=f"{prefix}:{t}")
+    if slots:
+        builder.adjust(3)
+    builder.row(InlineKeyboardButton(text="⬅️ Другой день", callback_data=back_cb))
+    return builder.as_markup(), len(slots)
+
+
+def confirm_kb():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Подтвердить запись", callback_data="confirm")
+    builder.button(text="❌ Отмена", callback_data="abort")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def skip_photo_kb():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➡️ Пропустить", callback_data="skip_photo")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def review_kb(booking_id: int):
+    builder = InlineKeyboardBuilder()
+    for rating in range(1, 6):
+        builder.button(text=f"{rating}", callback_data=f"rate:{booking_id}:{rating}")
+    builder.adjust(5)
+    return builder.as_markup()
+
+
+def faq_kb():
+    builder = InlineKeyboardBuilder()
+    for i, (question, _answer) in enumerate(FAQ):
+        builder.button(text=question, callback_data=f"faq:{i}")
+    builder.row(InlineKeyboardButton(text="⬅️ К меню", callback_data="faq:menu"))
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def my_kb(rows: list[sqlite3.Row]):
+    builder = InlineKeyboardBuilder()
+    for row in rows:
+        short_day = f"{row['day'][8:]}.{row['day'][5:7]}"
+        builder.row(
+            InlineKeyboardButton(
+                text=f"🔁 {short_day} {row['time']}",
+                callback_data=f"move:{row['id']}"),
+            InlineKeyboardButton(
+                text="❌ Отменить",
+                callback_data=f"cancel:{row['id']}"),
+        )
+    builder.row(InlineKeyboardButton(text="📝 Новая запись", callback_data="new:booking"))
+    return builder.as_markup()
+
+
+def admin_menu_kb():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📅 Сегодня", callback_data="adm:today")
+    builder.button(text="📆 Завтра", callback_data="adm:tomorrow")
+    builder.button(text="🗓 7 дней", callback_data="adm:week")
+    builder.button(text="📊 Статистика", callback_data="adm:stats")
+    builder.button(text="📤 CSV", callback_data="adm:export")
+    builder.button(text="📗 Таблица", callback_data="adm:sync")
+    builder.button(text="📣 Рассылка", callback_data="adm:broadcast")
+    builder.button(text="🚫 Закрыть слот", callback_data="adm:close")
+    builder.button(text="🏁 Заказ готов", callback_data="adm:ready")
+    builder.button(text="⭐ Отзывы", callback_data="adm:reviews")
+    builder.adjust(3, 3, 2, 2)
+    return builder.as_markup()
+
+
+# ============================== СОСТОЯНИЯ ==============================
+
+class Form(StatesGroup):
+    model = State()
+    name = State()
+    phone = State()
+    photo = State()
+
+
+class AdminForm(StatesGroup):
+    broadcast = State()
+    close = State()
+    ready = State()
+
+
+class WarrantyForm(StatesGroup):
+    phone = State()
+
+
+# ============================== ВСПОМОГАТЕЛЬНОЕ ==============================
+
+def cb_int(data: str | None, index: int = 1) -> int | None:
+    try:
+        return int((data or "").split(":")[index])
+    except (IndexError, ValueError):
+        return None
+
+
+async def notify(bot: Bot, chat_id: int, text: str, markup=None, attempt: int = 0) -> bool:
+    """Отправка с защитой от блокировок, флуд-лимитов и битого HTML."""
+    try:
+        await bot.send_message(
+            chat_id, text, reply_markup=markup,
+            parse_mode=ParseMode.HTML, link_preview_is_disabled=True,
+        )
+        return True
+    except TelegramForbiddenError:
+        return True  # пользователь заблокировал бота — повторять бессмысленно
+    except TelegramRetryAfter as e:
+        if attempt >= 2:
+            return False
+        await asyncio.sleep(min(e.retry_after, 20))
+        return await notify(bot, chat_id, text, markup, attempt + 1)
+    except TelegramBadRequest as e:
+        logging.warning("HTML отклонён для %s: %s", chat_id, e)
+        try:
+            await bot.send_message(
+                chat_id, re.sub(r"<[^>]+>", "", text),
+                reply_markup=markup, parse_mode=None,
+            )
+            return True
+        except TelegramAPIError:
+            return False
+    except TelegramAPIError:
+        logging.exception("Не удалось отправить сообщение %s", chat_id)
+        return False
+
+
+async def notify_photo(bot: Bot, chat_id: int, photo_id: str, caption: str, markup=None) -> bool:
+    try:
+        await bot.send_photo(
+            chat_id, photo_id, caption=caption[:1024],
+            reply_markup=markup, parse_mode=ParseMode.HTML,
+        )
+        return True
+    except TelegramAPIError:
+        logging.exception("Не удалось отправить фото в %s", chat_id)
+        return await notify(bot, chat_id, caption, markup)
+
+
+async def send_plain(bot: Bot, chat_id: int, text: str) -> bool:
+    try:
+        await bot.send_message(chat_id, text, parse_mode=None)
+        return True
+    except TelegramForbiddenError:
+        return False
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(min(e.retry_after, 20))
+        try:
+            await bot.send_message(chat_id, text, parse_mode=None)
+            return True
+        except TelegramAPIError:
+            return False
+    except TelegramAPIError:
+        logging.warning("Рассылка не доставлена %s", chat_id)
+        return False
+
+
+def my_text(user_id: int) -> tuple[str, object]:
+    rows = active_bookings(user_id)
+    ready = ready_bookings(user_id)
+    if not rows and not ready:
+        return ("У вас нет активных записей.\n\n"
+                "Нажмите «📝 Записаться», чтобы выбрать время."), None
+    lines: list[str] = []
+    if rows:
+        lines.append("<b>Ваши записи</b>")
+        for row in rows:
+            mark = "✅" if row["status"] == "confirmed" else "⏳"
+            lines.append(
+                f"{mark} <b>{fmt_day(row['day'])}, {row['time']}</b>\n"
+                f"   {esc(row['service'])}, {esc(row['model'])}"
+            )
+    if ready:
+        if lines:
+            lines.append("")
+        lines.append("<b>🔔 Готово к выдаче</b>")
+        for row in ready:
+            lines.append(
+                f"• {esc(row['service'])}, {esc(row['model'])}\n"
+                f"   {esc(ADDRESS)}, {esc(WORK_TEXT)}"
+            )
+    if rows:
+        lines.append("\nПеренести или отменить — кнопками ниже.")
+    return "\n".join(lines), my_kb(rows)
+
+
+async def send_my(message: Message, note: str = "") -> None:
+    text, markup = my_text(message.from_user.id)
+    if note:
+        text = f"{note}\n\n{text}"
+    await message.answer(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+
+
+async def edit_my(call: CallbackQuery, note: str = "") -> None:
+    text, markup = my_text(call.from_user.id)
+    if note:
+        text = f"{note}\n\n{text}"
+    try:
+        await call.message.edit_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+    except TelegramBadRequest:
+        pass
+
+
+def summary_text(data: dict) -> str:
+    text = (
+        "<b>Проверьте заявку</b>\n\n"
+        f"🔧 {esc(data['service'])} — {esc(data.get('price', ''))}\n"
+        f"📱 {esc(data['model'])}\n"
+        f"🗓 {fmt_day(data['day'])}, {data['time']}\n"
+        f"👤 {esc(data['name'])}\n"
+        f"📞 {esc(fmt_phone(data['phone']))}"
+    )
+    if data.get("photo_id"):
+        text += "\n📷 фото неисправности приложено"
+    return text
+
+
+def admin_booking_text(booking_id: int, data: dict, username: str | None,
+                       booking_day: str | None = None,
+                       booking_time: str | None = None) -> str:
+    text = (
+        f"🆕 <b>Заявка #{booking_id}</b>\n\n"
+        f"🗓 {fmt_day(booking_day or data['day'])} в {booking_time or data['time']}\n"
+        f"🔧 {esc(data['service'])} ({esc(data.get('price', ''))})\n"
+        f"📱 {esc(data['model'])}\n"
+        f"👤 {esc(data['name'])}\n"
+        f"📞 {esc(fmt_phone(data['phone']))}"
+    )
+    if username:
+        text += f"\n🔗 @{esc(username)}"
+    return text
+
+
+def admin_booking_kb(booking_id: int):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Подтвердить", callback_data=f"adm_ok:{booking_id}")
+    builder.button(text="❌ Отклонить", callback_data=f"adm_no:{booking_id}")
+    builder.button(text="🏁 Телефон готов", callback_data=f"adm_ready:{booking_id}")
+    builder.adjust(2, 1)
+    return builder.as_markup()
+
+
+def ready_text(row: sqlite3.Row) -> str:
+    return (
+        "🔔 <b>Ваш телефон готов!</b>\n\n"
+        f"{esc(row['service'])}, {esc(row['model'])}\n\n"
+        f"Забрать можно по адресу: {esc(ADDRESS)}\n"
+        f"🕒 {esc(WORK_TEXT)}\n📞 {esc(PHONE)}\n\n"
+        "Гарантия начинает действовать с сегодняшнего дня — "
+        "проверить срок можно кнопкой «🛡 Гарантия»."
+    )
+
+
+async def edit_admin_note(call: CallbackQuery, note: str) -> None:
+    """Дописывает статус в карточку заявки (текст или фото) и убирает кнопки."""
+    message = call.message
+    if message is None:
+        return
+    try:
+        if message.photo:
+            source = getattr(message, "html_caption", None) or esc(message.caption or "")
+            caption = source + f"\n\n{note}"
+            await message.edit_caption(caption=caption[:1024],
+                                       reply_markup=None, parse_mode=ParseMode.HTML)
+        else:
+            source = getattr(message, "html_text", None) or esc(message.text or "")
+            await message.edit_text(source + f"\n\n{note}",
+                                    reply_markup=None, parse_mode=ParseMode.HTML)
+    except TelegramBadRequest:
+        pass
+
+
+# ============================== СТАРТ И МЕНЮ ==============================
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    upsert_user(message.from_user)
+    text = (f"Здравствуйте! Это <b>{esc(SHOP_NAME)}</b>, ремонт телефонов.\n\n"
+            f"📍 {esc(ADDRESS)}\n🕒 {esc(WORK_TEXT)}\n\n"
+            "Выберите действие в меню внизу.")
+    booking = next_booking(message.from_user.id)
+    if booking:
+        text += (f"\n\nВаша ближайшая запись: <b>{fmt_day(booking['day'])}, "
+                 f"{booking['time']}</b>")
+    await message.answer(text, reply_markup=menu_kb(message.from_user.id),
+                         parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("help"))
+@router.message(F.text == BTN_HELP)
+async def cmd_help(message: Message):
+    await message.answer(
+        "<b>Как записаться</b>\n"
+        "1. Нажмите «📝 Записаться» и выберите услугу.\n"
+        "2. Напишите модель телефона.\n"
+        "3. Выберите день и время.\n"
+        "4. Оставьте имя и телефон.\n"
+        "5. При желании приложите фото неисправности.\n"
+        "6. Проверьте заявку и нажмите «Подтвердить».\n\n"
+        "Заявка сразу уходит мастеру, он подтвердит запись сообщением. "
+        "Когда ремонт будет готов, придёт уведомление.\n\n"
+        "Отменить или перенести визит можно в «📋 Мои записи».\n"
+        "Срок гарантии — в «🛡 Гарантия», частые вопросы — в «❓ Вопросы».\n"
+        f"Связаться: {esc(PHONE)} или {esc(TELEGRAM_URL)}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Хорошо, отменил. Что дальше?",
+                         reply_markup=menu_kb(message.from_user.id))
+
+
+@router.message(Command("id"))
+async def cmd_id(message: Message):
+    await message.answer(f"Ваш Telegram ID: <code>{message.from_user.id}</code>",
+                         parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("unsubscribe"))
+async def cmd_unsubscribe(message: Message):
+    set_opt_in(message.from_user.id, False)
+    await message.answer("Готово: рекламные рассылки больше не придут. "
+                         "Напоминания о ваших записях останутся.")
+
+
+@router.message(Command("subscribe"))
+async def cmd_subscribe(message: Message):
+    set_opt_in(message.from_user.id, True)
+    await message.answer("Снова подписали вас на новости и акции.")
+
+
+@router.message(F.text == BTN_BOOK)
+async def book(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Что нужно отремонтировать?", reply_markup=services_kb())
+
+
+@router.message(F.text == BTN_PRICES)
+async def prices(message: Message):
+    lines = [f"• {esc(n)}: <b>{esc(p)}</b>, {esc(t)}" for n, p, t in SERVICES]
+    await message.answer(
+        "<b>Ориентировочные цены</b>\n\n" + "\n".join(lines) +
+        "\n\nТочную стоимость назовём после бесплатной диагностики.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(F.text == BTN_CONTACTS)
+async def contacts(message: Message):
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="💬 Написать в Telegram", url=TELEGRAM_URL))
+    if MAPS_URL:
+        builder.row(InlineKeyboardButton(text="🗺 Открыть на карте", url=MAPS_URL))
+    await message.answer(
+        f"<b>{esc(SHOP_NAME)}</b>\n\n"
+        f"📍 {esc(ADDRESS)}\n"
+        f"📞 {esc(PHONE)}\n"
+        f"🕒 {esc(WORK_TEXT)}",
+        reply_markup=builder.as_markup(),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Command("my"))
+@router.message(F.text == BTN_MY)
+async def my_bookings(message: Message):
+    await send_my(message)
+
+
+# ---------- вопросы и ответы ----------
+
+@router.message(Command("faq"))
+@router.message(F.text == BTN_FAQ)
+async def faq_menu(message: Message):
+    await message.answer("<b>Частые вопросы</b>\n\nВыберите вопрос:",
+                         reply_markup=faq_kb(), parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data.startswith("faq:"))
+async def faq_answer(call: CallbackQuery):
+    value = (call.data or "").split(":", 1)[-1]
+    if value == "menu":
+        await call.message.edit_text("<b>Частые вопросы</b>\n\nВыберите вопрос:",
+                                     reply_markup=faq_kb(), parse_mode=ParseMode.HTML)
+        return await call.answer()
+    index = cb_int(call.data)
+    if index is None or not 0 <= index < len(FAQ):
+        return await call.answer("Вопрос не найден", show_alert=True)
+    question, answer = FAQ[index]
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="⬅️ Все вопросы", callback_data="faq:menu"))
+    await call.message.edit_text(
+        f"<b>{esc(question)}</b>\n\n{answer}",
+        reply_markup=builder.as_markup(), parse_mode=ParseMode.HTML)
+    await call.answer()
+
+
+# ---------- гарантия ----------
+
+@router.message(Command("warranty"))
+@router.message(F.text == BTN_WARRANTY)
+async def warranty_start(message: Message, state: FSMContext):
+    text = message.text or ""
+    arg = text.partition(" ")[2].strip() if text.startswith("/") else ""
+    if arg:
+        return await send_warranty(message, arg)
+    await state.set_state(WarrantyForm.phone)
+    await message.answer("Напишите номер телефона, на который оформлялся ремонт "
+                         "(например, +7 900 000-00-00):")
+
+
+@router.message(WarrantyForm.phone, F.text)
+async def warranty_phone(message: Message, state: FSMContext):
+    await state.set_state(None)
+    await send_warranty(message, message.text or "")
+
+
+async def send_warranty(message: Message, raw: str) -> None:
+    phone = normalize_phone(raw)
+    if phone is None:
+        return await message.answer("Не понял номер. Пример: +7 900 000-00-00")
+    rows = warranty_rows(phone)
+    if not rows:
+        return await message.answer(
+            "Не нашёл ремонт с таким номером. Если гарантия должна действовать — "
+            f"позвоните нам: {esc(PHONE)}", parse_mode=ParseMode.HTML)
+    today = now().date()
+    lines = ["<b>🛡 Гарантия</b>"]
+    for row in rows[:5]:
+        try:
+            start = date.fromisoformat((row["ready_at"] or "")[:10])
+        except ValueError:
+            continue
+        until = add_months(start, WARRANTY_MONTHS)
+        left = (until - today).days
+        if left >= 0:
+            lines.append(
+                f"• {esc(row['service'])}, {esc(row['model'])}\n"
+                f"   действует до <b>{until:%d.%m.%Y}</b> (осталось {left} дн.)")
+        else:
+            lines.append(
+                f"• {esc(row['service'])}, {esc(row['model'])}\n"
+                f"   истекла {until:%d.%m.%Y}")
+    lines.append("\nЛюбые вопросы по гарантии: " + esc(PHONE))
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# ---------- отзывы ----------
+
+@router.callback_query(F.data.startswith("rate:"))
+async def rate_booking(call: CallbackQuery, bot: Bot):
+    parts = (call.data or "").split(":")
+    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+        return await call.answer("Некорректная оценка", show_alert=True)
+    booking_id, rating = int(parts[1]), int(parts[2])
+    row = get_booking(booking_id)
+    if row is None or row["user_id"] != call.from_user.id:
+        return await call.answer("Запись не найдена", show_alert=True)
+    if not 1 <= rating <= 5:
+        return await call.answer("Оценка от 1 до 5", show_alert=True)
+    with db() as conn:
+        if conn.execute("SELECT 1 FROM reviews WHERE booking_id=?",
+                        (booking_id,)).fetchone():
+            return await call.answer("Вы уже оценили, спасибо!")
+    save_review(booking_id, call.from_user.id, rating)
+    stars = "⭐" * rating
+    markup = None
+    if rating >= 4:
+        text = f"Спасибо! {stars}\n\nРады, что всё хорошо."
+        if REVIEW_URL:
+            builder = InlineKeyboardBuilder()
+            builder.row(InlineKeyboardButton(text="Оставить отзыв", url=REVIEW_URL))
+            markup = builder.as_markup()
+            text += "\nБудем благодарны за отзыв на карте — это очень помогает."
+    else:
+        text = (f"{stars}\n\nСпасибо за честность. Передал мастеру — "
+                "постараемся разобраться и стать лучше.")
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(text="💬 Написать нам", url=TELEGRAM_URL))
+        markup = builder.as_markup()
+        if ADMIN_ID:
+            await notify(bot, ADMIN_ID,
+                         f"⚠️ Низкая оценка {rating}/5\n"
+                         f"#{row['id']} {esc(row['name'])}, {esc(row['service'])}\n"
+                         f"{esc(row['day'])} {row['time']}, {esc(fmt_phone(row['phone']))}")
+    try:
+        await call.message.edit_text(text, reply_markup=markup,
+                                     parse_mode=ParseMode.HTML)
+    except TelegramBadRequest:
+        pass
+    await call.answer("Спасибо за отзыв!")
+
+
+# ============================== ЗАПИСЬ ==============================
+
+@router.callback_query(F.data.startswith("svc:"))
+async def pick_service(call: CallbackQuery, state: FSMContext):
+    index = cb_int(call.data)
+    if index is None or not 0 <= index < len(SERVICES):
+        await call.message.edit_text("Список услуг обновился, выберите заново:",
+                                     reply_markup=services_kb())
+        return await call.answer()
+    name, price, term = SERVICES[index]
+    await state.clear()
+    await state.update_data(service=name, price=price, term=term)
+    await state.set_state(Form.model)
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="⬅️ Другая услуга", callback_data="back:svc"))
+    await call.message.edit_text(
+        f"Услуга: <b>{esc(name)}</b>\nЦена: {esc(price)}, срок: {esc(term)}\n\n"
+        "Напишите модель телефона (например, iPhone 12 или Redmi Note 11):",
+        reply_markup=builder.as_markup(),
+        parse_mode=ParseMode.HTML,
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "back:svc")
+async def back_to_services(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("Что нужно отремонтировать?", reply_markup=services_kb())
+    await call.answer()
+
+
+@router.callback_query(F.data == "back:model")
+async def back_to_model(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    data.pop("day", None)
+    data.pop("time", None)
+    await state.set_data(data)
+    await state.set_state(Form.model)
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="⬅️ Другая услуга", callback_data="back:svc"))
+    await call.message.edit_text(
+        "Напишите модель телефона ещё раз:",
+        reply_markup=builder.as_markup(),
+    )
+    await call.answer()
+
+
+@router.message(Form.model, F.text)
+async def get_model(message: Message, state: FSMContext):
+    model = clean_model(message.text)
+    if model is None:
+        return await message.answer(
+            "Модель не распознал. Напишите коротко текстом, например: iPhone 12.")
+    data = await state.get_data()
+    if "service" not in data:
+        await state.clear()
+        return await message.answer("Начнём заново: нажмите «📝 Записаться».")
+    await state.update_data(model=model)
+    await state.set_state(None)   # дальше идём по кнопкам, а не по тексту
+    keyboard = days_kb("day", back_cb="back:model")
+    if keyboard is None:
+        return await message.answer(
+            "Свободных слотов на ближайшую неделю нет. "
+            f"Позвоните нам: {esc(PHONE)}", parse_mode=ParseMode.HTML)
+    await message.answer(
+        f"Услуга: <b>{esc(data['service'])}</b>, телефон: {esc(model)}\n\nВыберите день:",
+        reply_markup=keyboard, parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data.startswith("day:"))
+async def pick_day(call: CallbackQuery, state: FSMContext):
+    day = (call.data or "").split(":", 1)[-1]
+    if not is_bookable_day(day):
+        await call.answer("Этот день недоступен", show_alert=True)
+        keyboard = days_kb("day", back_cb="back:model")
+        if keyboard:
+            await call.message.edit_reply_markup(reply_markup=keyboard)
+        return
+    keyboard, count = times_kb(day, "time", back_cb="back:day")
+    if count == 0:
+        await call.answer("На этот день свободного времени уже нет", show_alert=True)
+        return
+    data = await state.get_data()
+    await state.update_data(day=day)
+    text = f"Шаг 3. {fmt_day(day)}, выберите время:"
+    if data.get("service"):
+        text = f"{esc(data['service'])}, {esc(data.get('model', ''))}\n\n" + text
+    await call.message.edit_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    await call.answer()
+
+
+@router.callback_query(F.data == "back:day")
+async def back_to_day(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    keyboard = days_kb("day", back_cb="back:model")
+    if keyboard is None:
+        await call.answer("Свободных дней не осталось", show_alert=True)
+        return
+    await call.message.edit_text("Выберите день:", reply_markup=keyboard)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("time:"))
+async def pick_time(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("day") or not data.get("service"):
+        await call.message.answer("Давайте начнём заново: нажмите «📝 Записаться».")
+        return await call.answer()
+    slot = (call.data or "").split(":", 1)[-1]
+    if slot not in slot_times() or slot not in free_slots(data["day"]):
+        await call.answer("Это время только что заняли, выберите другое", show_alert=True)
+        await call.message.edit_reply_markup(reply_markup=times_kb(data["day"])[0])
+        return
+    await state.update_data(time=slot)
+    await state.set_state(Form.name)
+    await call.message.edit_text(
+        f"Выбрано: <b>{fmt_day(data['day'])}, {slot}</b>\n\nКак вас зовут?",
+        parse_mode=ParseMode.HTML)
+    await call.answer()
+
+
+@router.message(Form.name, F.text)
+async def get_name(message: Message, state: FSMContext):
+    name = clean_name(message.text)
+    if name is None:
+        return await message.answer("Имя должно быть текстом, 2-50 символов. Напишите ещё раз:")
+    await state.update_data(name=name)
+    await state.set_state(Form.phone)
+    await message.answer("Отправьте номер телефона кнопкой ниже или напишите вручную:",
+                         reply_markup=phone_kb())
+
+
+@router.message(Form.phone, F.contact | F.text)
+async def get_phone(message: Message, state: FSMContext):
+    contact = message.contact
+    if contact is not None:
+        if contact.user_id and contact.user_id != message.from_user.id:
+            return await message.answer("Это чужой контакт. Отправьте свой номер.")
+        raw = contact.phone_number
+    else:
+        raw = message.text or ""
+    phone = normalize_phone(raw)
+    if phone is None:
+        return await message.answer(
+            "Не похоже на номер. Напишите в формате +7 900 000-00-00 или отправьте кнопкой.",
+            reply_markup=phone_kb())
+    await state.update_data(phone=phone)
+    await state.set_state(Form.photo)
+    await message.answer(
+        "Номер принят. Можно приложить фото неисправности — мастер посмотрит заранее "
+        "и уточнит стоимость. Это необязательно.",
+        reply_markup=menu_kb(message.from_user.id))
+    await message.answer("Пришлите фото или пропустите шаг:",
+                         reply_markup=skip_photo_kb())
+
+
+async def show_summary(message: Message, state: FSMContext) -> None:
+    """Показывает итог заявки и кнопки подтверждения."""
+    data = await state.get_data()
+    await state.set_state(None)
+    await message.answer(summary_text(data), reply_markup=confirm_kb(),
+                         parse_mode=ParseMode.HTML)
+
+
+@router.message(Form.photo, F.photo)
+async def get_photo(message: Message, state: FSMContext):
+    await state.update_data(photo_id=message.photo[-1].file_id)
+    await message.answer("Фото прикреплено 📷")
+    await show_summary(message, state)
+
+
+@router.message(Form.photo, F.text)
+async def photo_as_skip(message: Message, state: FSMContext):
+    await show_summary(message, state)
+
+
+@router.callback_query(F.data == "skip_photo")
+async def skip_photo(call: CallbackQuery, state: FSMContext):
+    if await state.get_state() != Form.photo.state:
+        return await call.answer()
+    try:
+        await call.message.edit_text("Хорошо, без фото.")
+    except TelegramBadRequest:
+        pass
+    await show_summary(call.message, state)
+    await call.answer()
+
+
+@router.callback_query(F.data == "abort")
+async def abort(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await call.message.edit_text("Заявка отменена. Чтобы начать заново, нажмите «📝 Записаться».")
+    except TelegramBadRequest:
+        pass
+    await call.answer()
+
+
+@router.callback_query(F.data == "new:booking")
+async def new_booking(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.answer("Что нужно отремонтировать?", reply_markup=services_kb())
+    await call.answer()
+
+
+@router.callback_query(F.data == "confirm")
+async def confirm(call: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    required = ("service", "model", "day", "time", "name", "phone")
+    if any(not data.get(key) for key in required):
+        await state.clear()
+        await call.message.edit_text("Данные заявки потерялись. Начните заново: «📝 Записаться».")
+        return await call.answer()
+
+    day, slot = data["day"], data["time"]
+    if not is_bookable_day(day) or slot not in slot_times() or slot not in free_slots(day):
+        await state.clear()
+        await call.message.edit_text("Это время уже недоступно. Выберите другое: «📝 Записаться».")
+        return await call.answer()
+    if slot_dt(day, slot) <= now() + timedelta(minutes=LEAD_MINUTES):
+        await state.clear()
+        await call.message.edit_text("Это время уже прошло. Выберите другое: «📝 Записаться».")
+        return await call.answer()
+    if active_count(call.from_user.id) >= MAX_ACTIVE:
+        await state.clear()
+        await call.message.edit_text(
+            f"У вас уже {MAX_ACTIVE} активных записи. Отмените одну в «📋 Мои записи» "
+            "или позвоните нам.")
+        return await call.answer()
+
+    try:
+        with db() as conn:
+            cursor = conn.execute(
+                """INSERT INTO bookings
+                   (user_id, username, name, phone, service, price, model, day, time,
+                    status, created_at, photo_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+                (call.from_user.id, call.from_user.username, data["name"], data["phone"],
+                 data["service"], data.get("price"), data["model"], day, slot,
+                 iso_now(), data.get("photo_id")),
+            )
+            booking_id = int(cursor.lastrowid)
+    except sqlite3.IntegrityError:
+        await state.clear()
+        await call.message.edit_text(
+            "Это время только что заняли. Нажмите «📝 Записаться» и выберите другое.")
+        return await call.answer()
+
+    await state.clear()
+    try:
+        await call.message.edit_text(
+            "✅ <b>Заявка принята!</b>\n\n"
+            f"🗓 {fmt_day(day)} в {slot}\n"
+            f"🔧 {esc(data['service'])}, {esc(data['model'])}\n\n"
+            f"📍 {esc(ADDRESS)}\n📞 {esc(PHONE)}\n\n"
+            "Скоро подтвердим запись — пришлём сообщение.\n"
+            "Отменить или перенести можно в «📋 Мои записи».",
+            parse_mode=ParseMode.HTML)
+    except TelegramBadRequest:
+        pass
+    await call.answer("Заявка отправлена")
+
+    if ADMIN_ID:
+        text = admin_booking_text(booking_id, data, call.from_user.username)
+        if data.get("photo_id"):
+            await notify_photo(bot, ADMIN_ID, data["photo_id"], text,
+                               admin_booking_kb(booking_id))
+        else:
+            await notify(bot, ADMIN_ID, text, markup=admin_booking_kb(booking_id))
+    spawn_sheet_sync(booking_id)
+
+
+# ============================== МОИ ЗАПИСИ: ОТМЕНА И ПЕРЕНОС ==============================
+
+@router.callback_query(F.data.startswith("cancel:"))
+async def cancel_booking(call: CallbackQuery, state: FSMContext, bot: Bot):
+    booking_id = cb_int(call.data)
+    row = get_booking(booking_id) if booking_id else None
+    if row is None or row["user_id"] != call.from_user.id:
+        await call.answer("Запись не найдена", show_alert=True)
+        return
+    if row["status"] not in ACTIVE_STATUSES:
+        await call.answer("Эта запись уже не активна", show_alert=True)
+        return
+    with db() as conn:
+        conn.execute("UPDATE bookings SET status='cancelled' WHERE id=?", (row["id"],))
+    spawn_sheet_sync(row["id"])
+    await call.answer("Запись отменена")
+    await edit_my(call, note=f"Запись на {fmt_day(row['day'])}, {row['time']} отменена.")
+    if ADMIN_ID:
+        await notify(bot, ADMIN_ID,
+                     f"❌ Клиент отменил запись #{row['id']}: "
+                     f"{fmt_day(row['day'])} {row['time']}, {esc(row['name'])}, "
+                     f"{esc(fmt_phone(row['phone']))}")
+
+
+@router.callback_query(F.data.startswith("move:"))
+async def move_start(call: CallbackQuery, state: FSMContext):
+    booking_id = cb_int(call.data)
+    row = get_booking(booking_id) if booking_id else None
+    if row is None or row["user_id"] != call.from_user.id:
+        await call.answer("Запись не найдена", show_alert=True)
+        return
+    if row["status"] not in ACTIVE_STATUSES:
+        await call.answer("Эта запись уже не активна", show_alert=True)
+        return
+    await state.update_data(move_id=row["id"])
+    keyboard = days_kb("mday", back_cb="back:my", exclude=row)
+    if keyboard is None:
+        await call.answer("Свободных дней нет, позвоните нам", show_alert=True)
+        return
+    await call.message.edit_text(
+        f"Перенос записи с {fmt_day(row['day'])}, {row['time']}.\n\nВыберите новый день:",
+        reply_markup=keyboard)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("mday:"))
+async def move_day(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    move_id = data.get("move_id")
+    row = get_booking(int(move_id)) if move_id else None
+    if row is None or row["user_id"] != call.from_user.id:
+        await call.answer("Начните перенос заново", show_alert=True)
+        return
+    day = (call.data or "").split(":", 1)[-1]
+    if not is_bookable_day(day):
+        await call.answer("Этот день недоступен", show_alert=True)
+        return
+    keyboard, count = times_kb(day, "mtime", back_cb="mback:day", exclude=row)
+    if count == 0:
+        await call.answer("На этот день свободного времени нет", show_alert=True)
+        return
+    await state.update_data(move_day=day)
+    await call.message.edit_text(f"{fmt_day(day)}, выберите время:", reply_markup=keyboard)
+    await call.answer()
+
+
+@router.callback_query(F.data == "mback:day")
+async def move_back_day(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    move_id = data.get("move_id")
+    row = get_booking(int(move_id)) if move_id else None
+    keyboard = days_kb("mday", back_cb="back:my", exclude=row)
+    if keyboard is None:
+        await call.answer("Свободных дней нет", show_alert=True)
+        return
+    await call.message.edit_text("Выберите новый день:", reply_markup=keyboard)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("mtime:"))
+async def move_time(call: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    move_id = data.get("move_id")
+    row = get_booking(int(move_id)) if move_id else None
+    if row is None or row["user_id"] != call.from_user.id:
+        await call.answer("Начните перенос заново", show_alert=True)
+        return
+    if "move_day" not in data or not data["move_day"]:
+        await call.answer("Выберите день заново", show_alert=True)
+        return
+    day = data["move_day"]
+    slot = (call.data or "").split(":", 1)[-1]
+    if slot not in slot_times() or slot not in free_slots(day, exclude=row):
+        await call.answer("Это время только что заняли", show_alert=True)
+        await call.message.edit_reply_markup(
+            reply_markup=times_kb(day, "mtime", back_cb="mback:day", exclude=row)[0])
+        return
+    try:
+        with db() as conn:
+            conn.execute(
+                """UPDATE bookings
+                   SET day=?, time=?, status='pending', reminded_day=0, reminded_soon=0
+                   WHERE id=? AND user_id=?""",
+                (day, slot, row["id"], call.from_user.id),
+            )
+    except sqlite3.IntegrityError:
+        await call.answer("Это время только что заняли", show_alert=True)
+        return
+    spawn_sheet_sync(row["id"])
+    await state.update_data(move_id=None, move_day=None)
+    await call.answer("Запись перенесена")
+    await edit_my(call, note=(f"Запись перенесена: {fmt_day(day)}, {slot}.\n"
+                              "Мастер подтвердит новое время."))
+    if ADMIN_ID:
+        await notify(bot, ADMIN_ID,
+                     f"🔁 Клиент перенёс запись #{row['id']}: "
+                     f"{fmt_day(row['day'])} {row['time']} → {fmt_day(day)} {slot}\n"
+                     f"{esc(row['name'])}, {esc(fmt_phone(row['phone']))}")
+
+
+@router.callback_query(F.data == "back:my")
+async def back_to_my(call: CallbackQuery, state: FSMContext):
+    await state.update_data(move_id=None, move_day=None)
+    await edit_my(call)
+    await call.answer()
+
+
+# ============================== ДЛЯ ВЛАДЕЛЬЦА ==============================
+
+@router.message(F.text == BTN_ADMIN)
+async def admin_button(message: Message):
+    if not is_admin(message.from_user):
+        return
+    await message.answer("Админка:", reply_markup=admin_menu_kb())
+
+
+@router.message(Command("admin"))
+async def admin_command(message: Message):
+    if not is_admin(message.from_user):
+        return
+    await message.answer("Админка:", reply_markup=admin_menu_kb())
+
+
+@router.callback_query(F.data.startswith("adm_"))
+async def admin_action(call: CallbackQuery, bot: Bot):
+    if not is_admin(call.from_user):
+        return await call.answer("Недостаточно прав", show_alert=True)
+    action = (call.data or "").partition(":")[0]
+    booking_id = cb_int(call.data)
+    if booking_id is None:
+        return await call.answer("Некорректная кнопка", show_alert=True)
+    row = get_booking(booking_id)
+    if row is None:
+        await call.answer("Запись не найдена", show_alert=True)
+        return
+    if row["status"] not in ACTIVE_STATUSES:
+        await call.answer("Запись уже обработана", show_alert=True)
+        return
+
+    if action == "adm_ok":
+        with db() as conn:
+            conn.execute("UPDATE bookings SET status='confirmed' WHERE id=?", (row["id"],))
+        await notify(bot, row["user_id"],
+                     f"✅ Ваша запись на {fmt_day(row['day'])}, {row['time']} подтверждена.\n"
+                     f"Ждём вас: {esc(ADDRESS)}")
+        note = "✅ Подтверждено"
+    elif action == "adm_ready":
+        with db() as conn:
+            conn.execute("UPDATE bookings SET status='ready', ready_at=? WHERE id=?",
+                         (iso_now(), row["id"]))
+        await notify(bot, row["user_id"], ready_text(row))
+        note = "🏁 Клиент уведомлён, что телефон готов"
+    else:
+        with db() as conn:
+            conn.execute("UPDATE bookings SET status='cancelled' WHERE id=?", (row["id"],))
+        await notify(bot, row["user_id"],
+                     f"К сожалению, время {fmt_day(row['day'])}, {row['time']} не подходит.\n"
+                     "Выберите другое в «📝 Записаться» или позвоните нам: "
+                     f"{esc(PHONE)}")
+        note = "❌ Отклонено"
+
+    spawn_sheet_sync(row["id"])
+    await edit_admin_note(call, note)
+    await call.answer(note)
+
+
+@router.callback_query(F.data.startswith("adm:"))
+async def admin_menu_action(call: CallbackQuery, state: FSMContext, bot: Bot):
+    if not is_admin(call.from_user):
+        return await call.answer("Недостаточно прав", show_alert=True)
+    action = (call.data or "").split(":", 1)[-1]
+    if action == "today":
+        await call.message.edit_text(day_report(today_str()), reply_markup=admin_menu_kb(),
+                                     parse_mode=ParseMode.HTML)
+    elif action == "tomorrow":
+        tomorrow = (now().date() + timedelta(days=1)).isoformat()
+        await call.message.edit_text(day_report(tomorrow), reply_markup=admin_menu_kb(),
+                                     parse_mode=ParseMode.HTML)
+    elif action == "week":
+        await call.message.edit_text(week_report(), reply_markup=admin_menu_kb(),
+                                     parse_mode=ParseMode.HTML)
+    elif action == "stats":
+        await call.message.edit_text(stats_report(), reply_markup=admin_menu_kb(),
+                                     parse_mode=ParseMode.HTML)
+    elif action == "export":
+        await send_export(call.message)
+    elif action == "sync":
+        if not sheets_enabled():
+            await call.answer("Google Таблица не настроена", show_alert=True)
+        else:
+            count = 0
+            for booking_id in upcoming_booking_ids():
+                await asyncio.to_thread(sync_booking_to_sheet, booking_id)
+                count += 1
+            await call.answer(f"Отправлено в таблицу: {count}", show_alert=True)
+        return
+    elif action == "broadcast":
+        await call.message.answer(
+            f"Кому отправляем?\nВ боте: {len(all_user_ids())} чел.",
+            reply_markup=audience_kb())
+    elif action == "close":
+        await state.set_state(AdminForm.close)
+        await call.message.answer(
+            "Что закрываем? Напишите дату и, если нужно, время:\n"
+            "<code>20.11</code> — весь день\n"
+            "<code>20.11 14:00</code> — один час\n"
+            "Можно: <code>сегодня</code>, <code>завтра</code>. /cancel — отмена.",
+            parse_mode=ParseMode.HTML)
+    elif action == "ready":
+        await state.set_state(AdminForm.ready)
+        await call.message.answer(
+            "Напишите номер заявки (например, 12) или телефон клиента — "
+            "клиент получит сообщение, что телефон готов.")
+    elif action == "reviews":
+        await call.message.edit_text(reviews_report(), reply_markup=admin_menu_kb(),
+                                     parse_mode=ParseMode.HTML)
+    await call.answer()
+
+
+def parse_when(raw: str) -> str | None:
+    text = (raw or "").strip().lower().rstrip(".")
+    if text in ("сегодня", "today"):
+        return today_str()
+    if text in ("завтра", "tomorrow"):
+        return (now().date() + timedelta(days=1)).isoformat()
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m"):
+        try:
+            value = datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+        if fmt == "%d.%m":
+            value = value.replace(year=now().year)
+            if value < now().date():
+                value = value.replace(year=value.year + 1)
+        return value.isoformat()
+    return None
+
+
+def audience_kb():
+    builder = InlineKeyboardBuilder()
+    builder.button(text=f"👥 Всем ({len(user_ids_for('all'))})", callback_data="bc:all")
+    builder.button(text=f"🧾 Только клиентам ({len(user_ids_for('bookers'))})",
+                   callback_data="bc:bookers")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+def reviews_report() -> str:
+    average, count = review_stats()
+    lines = ["<b>Отзывы</b>", f"Средняя оценка: {average} из 5 (всего {count})"]
+    rows = recent_reviews(5)
+    if not rows:
+        lines.append("\nПока отзывов нет.")
+    for row in rows:
+        stars = "⭐" * int(row["rating"] or 0)
+        lines.append(f"{stars} — {esc(row['name'])}, {esc(row['service'])} "
+                     f"({(row['created_at'] or '')[:10]})")
+    return "\n".join(lines)
+
+
+def closures_report() -> str:
+    rows = upcoming_closures()
+    if not rows:
+        return "Закрытых дней и часов нет."
+    lines = ["<b>Закрыто на ближайшие 14 дней</b>"]
+    for row in rows:
+        when = fmt_day(row["day"]) + (f" {row['time']}" if row["time"] else " (весь день)")
+        lines.append("🚫 " + when + (f" — {esc(row['reason'])}" if row["reason"] else ""))
+    return "\n".join(lines)
+
+
+async def do_close(message: Message, state: FSMContext, close: bool) -> None:
+    parts = (message.text or "").split()
+    if parts and parts[0].startswith("/"):
+        parts = parts[1:]
+    day = parse_when(parts[0]) if parts else None
+    slot = parts[1] if len(parts) > 1 else None
+    if day is None or (slot is not None and slot not in slot_times()):
+        await message.answer(
+            "Не понял. Пример: <code>/close 20.11</code> или "
+            "<code>/close завтра 14:00</code>", parse_mode=ParseMode.HTML)
+        return
+    if close:
+        add_closure(day, slot)
+        affected = [r for r in bookings_for_day(day) if slot is None or r["time"] == slot]
+        text = f"🚫 Закрыто: {fmt_day(day)}" + (f" {slot}" if slot else " (весь день)")
+        if affected:
+            text += (f"\n\n⚠️ На это время уже есть записи ({len(affected)}). "
+                     "Перенесите или отмените их:")
+            for row in affected[:5]:
+                text += (f"\n• {row['time']} — {esc(row['name'])}, "
+                         f"{esc(fmt_phone(row['phone']))}")
+    else:
+        removed = remove_closure(day, slot)
+        text = (f"✅ Открыто: {fmt_day(day)}" + (f" {slot}" if slot else " (весь день)")
+                if removed else "Такого закрытия не было.")
+    await state.set_state(None)
+    await message.answer(text, parse_mode=ParseMode.HTML)
+
+
+async def mark_ready(message: Message, bot: Bot, raw: str) -> None:
+    row = None
+    target = (raw or "").strip()
+    if target.isdigit():
+        row = get_booking(int(target))
+    else:
+        phone = normalize_phone(target)
+        if phone:
+            with db() as conn:
+                row = conn.execute(
+                    "SELECT * FROM bookings WHERE phone=? "
+                    "AND status IN ('pending','confirmed') ORDER BY day, time LIMIT 1",
+                    (phone,)).fetchone()
+    if row is None:
+        return await message.answer("Не нашёл активную заявку с таким номером или телефоном.")
+    if row["status"] not in ACTIVE_STATUSES:
+        return await message.answer(
+            f"Заявка #{row['id']} уже в статусе «{row['status']}» — ничего не меняю.")
+    with db() as conn:
+        conn.execute("UPDATE bookings SET status='ready', ready_at=? WHERE id=?",
+                     (iso_now(), row["id"]))
+    await notify(bot, row["user_id"], ready_text(row))
+    spawn_sheet_sync(row["id"])
+    await message.answer(
+        f"Клиент уведомлён: #{row['id']} {esc(row['name'])}, "
+        f"{esc(row['service'])}, {esc(row['model'])}", parse_mode=ParseMode.HTML)
+
+
+def day_report(day: str) -> str:
+    rows = bookings_for_day(day)
+    title = f"<b>{fmt_day(day)}</b>"
+    if not rows:
+        return f"{title}\nЗаписей нет."
+    marks = {"confirmed": "✅", "pending": "⏳", "ready": "🔔", "done": "🏁"}
+    lines = [f"{title} — {len(rows)} запис."]
+    for row in rows:
+        mark = marks.get(row["status"], "•")
+        lines.append(
+            f"{mark} <b>{row['time']}</b> — {esc(row['name'])}, {esc(fmt_phone(row['phone']))}\n"
+            f"    {esc(row['service'])}, {esc(row['model'])}"
+        )
+    return "\n".join(lines)
+
+
+def week_report() -> str:
+    lines = ["<b>Ближайшие дни</b>"]
+    total = 0
+    for i in range(DAYS_AHEAD):
+        d = now().date() + timedelta(days=i)
+        if d.weekday() in DAYS_OFF:
+            continue
+        rows = bookings_for_day(d.isoformat())
+        total += len(rows)
+        lines.append(f"{fmt_day(d.isoformat())}: {len(rows)}")
+    lines.append(f"\nВсего за период: {total}")
+    return "\n".join(lines)
+
+
+def stats_report() -> str:
+    today = today_str()
+    with db() as conn:
+        def scalar(sql: str, params: tuple = ()) -> int:
+            return int(conn.execute(sql, params).fetchone()[0])
+
+        pending = scalar("SELECT COUNT(*) FROM bookings WHERE status='pending' AND day>=?", (today,))
+        confirmed = scalar("SELECT COUNT(*) FROM bookings WHERE status='confirmed' AND day>=?", (today,))
+        ready = scalar("SELECT COUNT(*) FROM bookings WHERE status='ready'")
+        today_count = scalar("SELECT COUNT(*) FROM bookings WHERE day=? AND status!='cancelled'", (today,))
+        users = scalar("SELECT COUNT(*) FROM users")
+        all_time = scalar("SELECT COUNT(*) FROM bookings")
+        closures = scalar("SELECT COUNT(*) FROM closures WHERE day>=?", (today,))
+    average, reviews = review_stats()
+    return (
+        "<b>Статистика</b>\n\n"
+        f"Сегодня записей: {today_count}\n"
+        f"Ожидают подтверждения: {pending}\n"
+        f"Подтверждено: {confirmed}\n"
+        f"Готовы к выдаче: {ready}\n"
+        f"Отзывов: {reviews}, средняя оценка: {average}\n"
+        f"Закрытых слотов впереди: {closures}\n"
+        f"Пользователей в боте: {users}\n"
+        f"Всего заявок за всё время: {all_time}"
+    )
+
+
+def find_bookings(query: str) -> list[sqlite3.Row]:
+    text = query.strip()
+    digits = re.sub(r"\D", "", text)
+    with db() as conn:
+        if len(digits) >= 4:
+            return conn.execute(
+                "SELECT * FROM bookings WHERE phone LIKE ? OR name LIKE ? OR model LIKE ? "
+                "ORDER BY day DESC, time DESC LIMIT 20",
+                (f"%{digits}%", f"%{text}%", f"%{text}%"),
+            ).fetchall()
+        return conn.execute(
+            "SELECT * FROM bookings WHERE name LIKE ? OR model LIKE ? "
+            "ORDER BY day DESC, time DESC LIMIT 20",
+            (f"%{text}%", f"%{text}%"),
+        ).fetchall()
+
+
+@router.message(Command("today"))
+async def cmd_today(message: Message):
+    if not is_admin(message.from_user):
+        return
+    await message.answer(day_report(today_str()), parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("tomorrow"))
+async def cmd_tomorrow(message: Message):
+    if not is_admin(message.from_user):
+        return
+    tomorrow = (now().date() + timedelta(days=1)).isoformat()
+    await message.answer(day_report(tomorrow), parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("week"))
+async def cmd_week(message: Message):
+    if not is_admin(message.from_user):
+        return
+    await message.answer(week_report(), parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if not is_admin(message.from_user):
+        return
+    await message.answer(stats_report(), parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("find"))
+async def cmd_find(message: Message):
+    if not is_admin(message.from_user):
+        return
+    query = (message.text or "").partition(" ")[2].strip()
+    if not query:
+        return await message.answer("Использование: <code>/find +79001234567</code>\n"
+                                    "Искать можно по телефону, имени или модели.",
+                                    parse_mode=ParseMode.HTML)
+    rows = find_bookings(query)
+    if not rows:
+        return await message.answer("Ничего не найдено.")
+    marks = {"confirmed": "✅", "pending": "⏳", "ready": "🔔",
+             "cancelled": "❌", "done": "🏁"}
+    lines = [f"Найдено: {len(rows)}"]
+    for row in rows:
+        mark = marks.get(row["status"], "•")
+        lines.append(
+            f"{mark} #{row['id']} {fmt_day(row['day'])} {row['time']}\n"
+            f"    {esc(row['name'])}, {esc(fmt_phone(row['phone']))}\n"
+            f"    {esc(row['service'])}, {esc(row['model'])}"
+        )
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def send_export(message: Message) -> None:
+    today = today_str()
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM bookings WHERE day>=? ORDER BY day, time", (today,)
+        ).fetchall()
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, delimiter=";")
+    writer.writerow(["id", "date", "time", "status", "service", "model",
+                     "name", "phone", "username", "created"])
+    for row in rows:
+        writer.writerow([
+            row["id"], row["day"], row["time"], row["status"], row["service"],
+            row["model"], row["name"], row["phone"], row["username"], row["created_at"],
+        ])
+    payload = buffer.getvalue().encode("utf-8-sig")
+    await message.answer_document(
+        BufferedInputFile(payload, filename=f"bookings_{today}.csv"),
+        caption=f"Записи с {today}: {len(rows)}",
+    )
+
+
+@router.message(Command("export"))
+async def cmd_export(message: Message):
+    if not is_admin(message.from_user):
+        return
+    await send_export(message)
+
+
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        return
+    await message.answer(
+        f"Кому отправляем?\nВ боте: {len(all_user_ids())} чел.",
+        reply_markup=audience_kb())
+
+
+@router.callback_query(F.data.startswith("bc:"))
+async def broadcast_audience(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user):
+        return await call.answer("Недостаточно прав", show_alert=True)
+    audience = (call.data or "").split(":", 1)[-1]
+    if audience not in ("all", "bookers"):
+        return await call.answer("Не понял аудиторию", show_alert=True)
+    await state.update_data(audience=audience)
+    await state.set_state(AdminForm.broadcast)
+    count = len(user_ids_for(audience))
+    await call.message.edit_text(
+        f"Получателей: {count}.\n\nОтправьте текст акции одним сообщением. "
+        "Пишите по делу и не чаще пары раз в месяц.\n/cancel — отмена.")
+    await call.answer()
+
+
+@router.message(AdminForm.broadcast, F.text)
+async def do_broadcast(message: Message, state: FSMContext, bot: Bot):
+    if not is_admin(message.from_user):
+        await state.clear()
+        return
+    text = (message.text or "").strip()
+    if text.startswith("/"):
+        await state.clear()
+        return await message.answer("Отменил рассылку. Повторите команду, если нужно.")
+    if not text:
+        return await message.answer("Нужен текст сообщения.")
+    audience = (await state.get_data()).get("audience", "all")
+    await state.clear()
+    user_ids = user_ids_for(audience)
+    status = await message.answer(f"Рассылаю {len(user_ids)} пользователям…")
+    delivered = failed = 0
+    for user_id in user_ids:
+        if await send_plain(bot, user_id, text):
+            delivered += 1
+        else:
+            failed += 1
+        await asyncio.sleep(0.05)
+    await status.edit_text(
+        f"Готово: доставлено {delivered}, не доставлено {failed}.\n"
+        "Клиент может отписаться командой /unsubscribe.")
+
+
+@router.message(Command("close"))
+async def cmd_close(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        return
+    if len((message.text or "").split()) == 1:
+        await state.set_state(AdminForm.close)
+        return await message.answer(
+            "Что закрываем? Напишите дату и, если нужно, время:\n"
+            "<code>20.11</code> — весь день\n"
+            "<code>20.11 14:00</code> — один час\n"
+            "Можно: <code>сегодня</code>, <code>завтра</code>. /cancel — отмена.",
+            parse_mode=ParseMode.HTML)
+    await do_close(message, state, close=True)
+
+
+@router.message(AdminForm.close, F.text)
+async def close_state(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        await state.clear()
+        return
+    if (message.text or "").strip().startswith("/"):
+        await state.clear()
+        return await message.answer("Отменил ввод. Повторите команду, если нужно.")
+    await do_close(message, state, close=True)
+
+
+@router.message(Command("open"))
+async def cmd_open(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        return
+    if len((message.text or "").split()) == 1:
+        return await message.answer("Пример: <code>/open 20.11</code> или "
+                                    "<code>/open 20.11 14:00</code>",
+                                    parse_mode=ParseMode.HTML)
+    await do_close(message, state, close=False)
+
+
+@router.message(Command("closures"))
+async def cmd_closures(message: Message):
+    if not is_admin(message.from_user):
+        return
+    await message.answer(closures_report(), parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("ready"))
+async def cmd_ready(message: Message, state: FSMContext, bot: Bot):
+    if not is_admin(message.from_user):
+        return
+    arg = (message.text or "").partition(" ")[2].strip()
+    if not arg:
+        await state.set_state(AdminForm.ready)
+        return await message.answer(
+            "Напишите номер заявки (например, 12) или телефон клиента — "
+            "клиент получит сообщение, что телефон готов.")
+    await mark_ready(message, bot, arg)
+
+
+@router.message(AdminForm.ready, F.text)
+async def ready_state(message: Message, state: FSMContext, bot: Bot):
+    if not is_admin(message.from_user):
+        await state.clear()
+        return
+    if (message.text or "").strip().startswith("/"):
+        await state.clear()
+        return await message.answer("Отменил ввод. Повторите команду, если нужно.")
+    await mark_ready(message, bot, message.text or "")
+    await state.set_state(None)
+
+
+@router.message(Command("reviews"))
+async def cmd_reviews(message: Message):
+    if not is_admin(message.from_user):
+        return
+    await message.answer(reviews_report(), parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("sync"))
+async def cmd_sync(message: Message):
+    if not is_admin(message.from_user):
+        return
+    if not sheets_enabled():
+        return await message.answer(
+            "Google Таблица не настроена.\nДобавьте в .env GOOGLE_SHEET_ID и "
+            "GOOGLE_CREDENTIALS_FILE, установите gspread и google-auth.")
+    if not sheets_ready():
+        return await message.answer(
+            "Не хватает библиотек: <code>pip install gspread google-auth</code>",
+            parse_mode=ParseMode.HTML)
+    count = 0
+    for booking_id in upcoming_booking_ids():
+        await asyncio.to_thread(sync_booking_to_sheet, booking_id)
+        count += 1
+    await message.answer(f"Синхронизировано записей: {count}")
+
+
+# ============================== НАПОМИНАНИЯ ==============================
+
+async def send_reminders(bot: Bot) -> None:
+    current = now()
+
+    # 1. Вечернее напоминание на завтра
+    if current.hour >= REMIND_EVENING_HOUR:
+        tomorrow = (current.date() + timedelta(days=1)).isoformat()
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT id, user_id, time, service, model FROM bookings "
+                "WHERE day=? AND status IN ('pending','confirmed') AND reminded_day=0",
+                (tomorrow,),
+            ).fetchall()
+        for row in rows:
+            text = (
+                "🔔 <b>Напоминание о записи</b>\n\n"
+                f"Завтра в <b>{row['time']}</b> ждём вас.\n"
+                f"🔧 {esc(row['service'])}, {esc(row['model'])}\n"
+                f"📍 {esc(ADDRESS)}\n📞 {esc(PHONE)}\n\n"
+                "Если планы изменились — отмените запись в «📋 Мои записи»."
+            )
+            if await notify(bot, row["user_id"], text):
+                with db() as conn:
+                    conn.execute("UPDATE bookings SET reminded_day=1 WHERE id=?", (row["id"],))
+            await asyncio.sleep(0.05)
+
+    # 2. Напоминание за REMIND_SOON_HOURS часов до визита
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, user_id, day, time, service, model FROM bookings "
+            "WHERE day=? AND status IN ('pending','confirmed') AND reminded_soon=0",
+            (current.date().isoformat(),),
+        ).fetchall()
+    for row in rows:
+        left = slot_dt(row["day"], row["time"]) - current
+        if not timedelta(0) < left <= timedelta(hours=REMIND_SOON_HOURS):
+            continue
+        hours = max(1, round(left.total_seconds() / 3600))
+        text = (
+            "⏰ <b>Скоро ждём вас</b>\n\n"
+            f"Сегодня в <b>{row['time']}</b> (~{hours} ч).\n"
+            f"🔧 {esc(row['service'])}, {esc(row['model'])}\n"
+            f"📍 {esc(ADDRESS)}"
+        )
+        if await notify(bot, row["user_id"], text):
+            with db() as conn:
+                conn.execute("UPDATE bookings SET reminded_soon=1 WHERE id=?", (row["id"],))
+        await asyncio.sleep(0.05)
+
+
+def review_due_bookings() -> list[sqlite3.Row]:
+    cutoff = (now() - timedelta(days=REVIEW_DELAY_DAYS)).replace(microsecond=0).isoformat()
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM bookings WHERE status IN ('ready','done') "
+            "AND review_requested=0 AND ready_at IS NOT NULL AND ready_at<=? "
+            "ORDER BY ready_at LIMIT 20",
+            (cutoff,),
+        ).fetchall()
+
+
+async def send_review_requests(bot: Bot) -> None:
+    for row in review_due_bookings():
+        text = (
+            "Как всё прошло с ремонтом?\n\n"
+            f"{esc(row['service'])}, {esc(row['model'])}\n\n"
+            "Оцените работу от 1 до 5 — это помогает нам становиться лучше."
+        )
+        if await notify(bot, row["user_id"], text, markup=review_kb(row["id"])):
+            with db() as conn:
+                conn.execute("UPDATE bookings SET review_requested=1 WHERE id=?",
+                             (row["id"],))
+        await asyncio.sleep(0.05)
+
+
+async def reminder_loop(bot: Bot) -> None:
+    while True:
+        try:
+            await send_reminders(bot)
+            await send_review_requests(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("Сбой в цикле напоминаний")
+        await asyncio.sleep(REMINDER_TICK)
+
+
+# ============================== ЗАПАСНОЙ ОБРАБОТЧИК ==============================
+
+@router.message()
+async def fallback(message: Message, state: FSMContext):
+    current = await state.get_state()
+    if current:
+        await message.answer(
+            "Не понял. Напишите текстом или нажмите /cancel, чтобы начать заново.",
+            reply_markup=menu_kb(message.from_user.id))
+    else:
+        await message.answer(
+            "Не понял команду. Выберите пункт меню внизу или нажмите /help.",
+            reply_markup=menu_kb(message.from_user.id))
+
+
+# ============================== ЗАПУСК ==============================
+
+def setup_logging() -> None:
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+    formatter = logging.Formatter("%(asctime)s %(levelname)-8s %(name)s: %(message)s")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    stream = logging.StreamHandler(sys.stdout)
+    stream.setFormatter(formatter)
+    root.addHandler(stream)
+    try:
+        file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+    except OSError:
+        logging.warning("Не удалось открыть файл логов %s", LOG_PATH)
+
+
+def make_bot() -> Bot:
+    try:
+        from aiogram.client.default import DefaultBotProperties
+
+        return Bot(BOT_TOKEN, default=DefaultBotProperties(
+            parse_mode=ParseMode.HTML, link_preview_is_disabled=True))
+    except ImportError:  # aiogram < 3.7
+        return Bot(BOT_TOKEN, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+async def set_commands(bot: Bot) -> None:
+    user_commands = [
+        BotCommand(command="start", description="Главное меню"),
+        BotCommand(command="my", description="Мои записи"),
+        BotCommand(command="faq", description="Частые вопросы"),
+        BotCommand(command="warranty", description="Проверить гарантию"),
+        BotCommand(command="cancel", description="Отменить ввод"),
+        BotCommand(command="help", description="Как записаться"),
+        BotCommand(command="id", description="Мой Telegram ID"),
+    ]
+    try:
+        await bot.set_my_commands(user_commands)
+    except TelegramAPIError:
+        logging.warning("Не удалось обновить список команд")
+    if ADMIN_ID:
+        admin_commands = user_commands + [
+            BotCommand(command="admin", description="Админка"),
+            BotCommand(command="today", description="Записи на сегодня"),
+            BotCommand(command="tomorrow", description="Записи на завтра"),
+            BotCommand(command="week", description="Записи на неделю"),
+            BotCommand(command="stats", description="Статистика"),
+            BotCommand(command="find", description="Поиск по клиенту"),
+            BotCommand(command="export", description="Выгрузка в CSV"),
+            BotCommand(command="sync", description="Выгрузить в Google Таблицу"),
+            BotCommand(command="broadcast", description="Рассылка"),
+            BotCommand(command="close", description="Закрыть день или час"),
+            BotCommand(command="open", description="Открыть день или час"),
+            BotCommand(command="closures", description="Закрытые дни"),
+            BotCommand(command="ready", description="Телефон готов"),
+            BotCommand(command="reviews", description="Отзывы"),
+        ]
+        try:
+            await bot.set_my_commands(admin_commands,
+                                      scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+        except TelegramAPIError:
+            logging.warning("Не удалось обновить команды админа (он не писал боту?)")
+
+
+def make_error_handler(bot: Bot):
+    async def on_error(event) -> bool:
+        logging.error("Ошибка при обработке апдейта", exc_info=event.exception)
+        if ADMIN_ID:
+            summary = f"{type(event.exception).__name__}: {event.exception}"
+            await send_plain(bot, ADMIN_ID, "⚠️ Ошибка в боте:\n" + summary[:3500])
+        return True
+
+    return on_error
+
+
+async def main() -> None:
+    setup_logging()
+    if not BOT_TOKEN or BOT_TOKEN == "ВСТАВЬТЕ_ТОКЕН_ОТ_BOTFATHER":
+        logging.error("Не задан BOT_TOKEN. Укажите его в переменной окружения или в .env.")
+        raise SystemExit(1)
+    if not ADMIN_ID:
+        logging.warning("ADMIN_ID не задан: заявки не будут приходить владельцу. "
+                        "Узнайте свой ID командой /id и добавьте его в .env.")
+
+    init_db()
+    bot = make_bot()
+    dispatcher = Dispatcher(storage=MemoryStorage())
+    dispatcher.include_router(router)
+    dispatcher.errors.register(make_error_handler(bot))
+    dispatcher.startup.register(set_commands)
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    reminder_task = asyncio.create_task(reminder_loop(bot))
+    try:
+        await dispatcher.start_polling(bot)
+    finally:
+        reminder_task.cancel()
+        try:
+            await reminder_task
+        except asyncio.CancelledError:
+            pass
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
